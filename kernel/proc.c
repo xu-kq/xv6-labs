@@ -18,6 +18,7 @@ struct spinlock pid_lock;
 extern void forkret(void);
 static void wakeup1(struct proc *chan);
 static void freeproc(struct proc *p);
+void kvm_free_kernelpgtbl(pagetable_t pagetable);
 
 extern char trampoline[]; // trampoline.S
 
@@ -34,12 +35,12 @@ procinit(void)
       // Allocate a page for the process's kernel stack.
       // Map it high in memory, followed by an invalid
       // guard page.
-      char *pa = kalloc();
+/*      char *pa = kalloc();
       if(pa == 0)
         panic("kalloc");
       uint64 va = KSTACK((int) (p - proc));
       kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
-      p->kstack = va;
+      p->kstack = va;*/
   }
   kvminithart();
 }
@@ -121,12 +122,27 @@ found:
     return 0;
   }
 
+
+    // per process kernel pagetable
+    p->kernel_pagetable = make_kernel_pagetable();
+    //initlock(&p->lock, "proc");
+
+    char* pa = kalloc();
+    if(pa == 0)
+        panic("allocproc");
+    uint64 va = KSTACK((int) (0));
+    make_kvmmap(p->kernel_pagetable,
+        va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+    p->kstack = va;
+    
+    //w_satp(MAKE_SATP(p->kernel_pagetable));
+    //sfence_vma();
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
-
   return p;
 }
 
@@ -149,6 +165,14 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+
+  void* kstack_pa = (void*) make_kvmpa(p->kernel_pagetable, p->kstack);
+  kfree(kstack_pa);
+  p->kstack = 0;
+
+  kvm_free_kernelpgtbl(p->kernel_pagetable);
+  p->kernel_pagetable = 0;
+  
   p->state = UNUSED;
 }
 
@@ -473,6 +497,12 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        
+
+        w_satp(MAKE_SATP(p->kernel_pagetable));
+        sfence_vma();
+        
+
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
@@ -481,6 +511,9 @@ scheduler(void)
 
         found = 1;
       }
+      //else {
+        //kvminithart();
+      //}
       release(&p->lock);
     }
 #if !defined (LAB_FS)
@@ -696,4 +729,20 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+void
+kvm_free_kernelpgtbl(pagetable_t pagetable)
+{
+  // there are 2^9 = 512 PTEs in a page table.
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    uint64 child = PTE2PA(pte);
+    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){ // 如果该页表项指向更低一级的页表
+      // 递归释放低一级页表及其页表项
+      kvm_free_kernelpgtbl((pagetable_t)child);
+      pagetable[i] = 0;
+    }
+  }
+  kfree((void*)pagetable); // 释放当前级别页表所占用空间
 }
